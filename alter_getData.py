@@ -15,7 +15,7 @@ from cinrad.error import RadarDecodeError
 from cinrad.io.base import RadarBase, prepare_file
 from cinrad.io._dtype import *
 from cinrad._typing import Number_T
-
+import tqdm
 __all__ = [ "StandardData"]
 
 ScanConfig = namedtuple("ScanConfig", SDD_cut.fields.keys())
@@ -673,14 +673,14 @@ class StandardData(RadarBase):
             'Beam_Width_Hori': self.geo['Beam_Width_Hori'],
             'Beam_Width_Vert': self.geo['Beam_Width_Vert'],
             'Serv_Ver': self.geo['Serv_Ver'],
-            "elevation": self.elev,
-            "range": int(np.round(min_ngates * unified_reso)),  # 范围由最小ngates决定
-            "scan_time": self.scantime.strftime("%Y-%m-%d %H:%M:%S"),
-            "unified_tangential_reso": unified_reso,
-            "original_resolutions": {info["dtype"]: info["reso"] for info in product_info},
-            "min_ngates_used": min_ngates,  # 记录使用的最小距离门数量
-            "nyquist_vel": self.scan_config[tilt].nyquist_spd if "VEL" in dtype_list else None,
-            "task": self.task_name,
+            # "elevation": self.elev,
+            # "range": int(np.round(min_ngates * unified_reso)),  # 范围由最小ngates决定
+            # "scan_time": self.scantime.strftime("%Y-%m-%d %H:%M:%S"),
+            # "unified_tangential_reso": unified_reso,
+            # "original_resolutions": {info["dtype"]: info["reso"] for info in product_info},
+            # "min_ngates_used": min_ngates,  # 记录使用的最小距离门数量
+            # "nyquist_vel": self.scan_config[tilt].nyquist_spd if "VEL" in dtype_list else None,
+            "task_name": self.task_name,
             "polar_type": self.geo['polar_type'],
             "scan_type": self.geo['scan_type'],
             "pulse_width": self.geo['pulse_width'],
@@ -690,7 +690,7 @@ class StandardData(RadarBase):
 
         return xr.Dataset(data_vars, attrs=attr)
 
-    def get_multi_elevation_data(self, elevation_config: Dict[int, List[str]], drange: float) -> xr.Dataset:
+    def get_multi_elevation_data_old(self, elevation_config: Dict[int, List[str]], drange: float) -> xr.Dataset:
         """
         获取多个仰角的雷达数据并合并到一个数据集中（含仰角去重，保留所有distance信息）
         """
@@ -737,6 +737,7 @@ class StandardData(RadarBase):
         for tilt_idx, products in elevation_config.items():
             # 获取该tilt的配置
             config_dict = self.scan_config[tilt_idx]._asdict()
+
             # 记录原始仰角和tilt索引
             elev_value = config_dict['elev']
             raw_elevation_angles.append(elev_value)
@@ -857,14 +858,14 @@ class StandardData(RadarBase):
 
         # 创建综合属性
         combined_attrs = dict(list(elevation_datasets.values())[0].attrs)
-        combined_attrs.update({
-            "elevation_angles": unique_elevations,
-            "elevation_count": n_unique_elev,
-            "products": list(all_products),
-            "azimuth_count": len(unified_azimuth),
-            "distance_count": len(unified_distance),  # 记录总距离点数
-            "max_distance": float(unified_distance[-1]) if len(unified_distance) > 0 else 0,
-        })
+        # combined_attrs.update({
+        #     "elevation_angles": unique_elevations,
+        #     "elevation_count": n_unique_elev,
+        #     "products": list(all_products),
+        #     "azimuth_count": len(unified_azimuth),
+        #     "distance_count": len(unified_distance),  # 记录总距离点数
+        #     "max_distance": float(unified_distance[-1]) if len(unified_distance) > 0 else 0,
+        # })
         self.scan_config_dict = unique_scan_config
 
         # 创建坐标
@@ -879,6 +880,225 @@ class StandardData(RadarBase):
 
         return combined_ds
 
+    def get_multi_elevation_data(self, elevation_config: Dict[int, List[str]], drange: float) -> xr.Dataset:
+        """
+        获取多个仰角的雷达数据并合并到一个数据集中（含仰角去重，保留所有distance信息）
+        优化点：向量化解法替代嵌套循环，预计算索引映射加速查找
+        """
+        attr_list = {
+            "PRF_1": "PRF1", "PRF_2": "PRF2", "Deal_mode": "dealias_mode",
+            "AZI": "azimuth", "ELE": "elev", "St_Angle": "start_angle",
+            "End_Angle": "end_angle", "Ang_Res": "angular_reso", "Scan_Spd": "scan_spd",
+            "Log_Res": "log_reso", "Dop_Res": "dop_reso", "Max_Range1": "max_range1",
+            "Max_Range2": "max_range2", "St_Range": "start_range", "Sample1": "sample1",
+            "Sample2": "sample2", "At_Loss": "atmos_loss", "Nyq_Spd": "nyquist_spd",
+            "Dir": "direction", "Cla_type": "ground_clutter_classifier_type",
+            "Fil_type": "ground_clutter_filter_type", "Fil_not_width": "ground_clutter_filter_notch_width",
+            "Fil_win": "ground_clutter_filter_window"
+        }
+
+        # 收集所有产品类型（无优化，保持原样）
+        all_products = set()
+        for products in elevation_config.values():
+            all_products.update(products)
+        all_products = sorted(list(all_products))
+
+        # 第一步：收集所有原始数据（含重复仰角）
+        elevation_datasets = {}  # 原始tilt索引: 数据集
+        raw_elevation_angles = []  # 原始仰角值（可能重复）
+        raw_tilt_indices = []  # 原始tilt索引
+        all_azimuths = []  # 用列表替代set，后续一次性去重排序（减少set插入开销）
+        all_distances = []  # 用列表替代set
+
+        scan_config_dict = {key: [] for key in attr_list.keys()}
+        for tilt_idx, products in elevation_config.items():
+            config_dict = self.scan_config[tilt_idx]._asdict()
+            elev_value = config_dict['elev']
+            raw_elevation_angles.append(elev_value)
+            raw_tilt_indices.append(tilt_idx)
+
+            # 记录配置信息
+            for key, name in attr_list.items():
+                scan_config_dict[key].append(config_dict[name])
+
+            # 加载数据集
+            ds = self.get_data_multi(tilt_idx, drange, products)
+            if ds is not None:
+                elevation_datasets[tilt_idx] = ds
+                # 批量收集方位角和距离（后续统一去重）
+                all_azimuths.extend(ds.azimuth.values)
+                all_distances.extend(ds.distance.values)
+
+        if not elevation_datasets:
+            print("elevation_datasets is empty")
+            return None
+
+        # 统一处理方位角和距离的去重与排序（向量化操作）
+        unified_azimuth = np.unique(all_azimuths)  # 四舍五入后去重（减少精度干扰）
+        unified_distance = np.unique(all_distances)  # 四舍五入到5位小数，平衡精度与效率
+        # 预创建坐标到索引的映射表（O(1)查找）
+        az_to_idx = {az: idx for idx, az in enumerate(unified_azimuth)}
+        dist_to_idx = {dist: idx for idx, dist in enumerate(unified_distance)}
+
+        # 第二步：仰角去重（用pandas加速去重，保留原始顺序）
+        import pandas as pd  # 若已有导入可移除
+        # 用DataFrame去重并保留首次出现的索引
+        df_elev = pd.DataFrame({
+            'elev': raw_elevation_angles,
+            'orig_idx': range(len(raw_elevation_angles)),
+            'tilt_idx': raw_tilt_indices
+        })
+        df_unique_elev = df_elev.drop_duplicates(subset='elev', keep='first').sort_index()
+        unique_elevations = df_unique_elev['elev'].values
+        unique_indices = df_unique_elev['orig_idx'].values  # 去重后保留的原始配置索引
+        unique_tilt_indices = df_unique_elev['tilt_idx'].values  # 去重后对应的tilt索引
+        n_unique_elev = len(unique_elevations)
+
+        # 第三步：调整配置信息（向量化索引）
+        unique_scan_config = {
+            key: [scan_config_dict[key][i] for i in unique_indices]
+            for key in scan_config_dict
+        }
+
+        # 第四步：填充产品数据（核心优化：向量化解法）
+        data_vars = {}
+        for product in all_products:
+            # 初始化产品数据数组（shape: [n_elev, n_az, n_dist]）
+            product_data = np.full(
+                (n_unique_elev, len(unified_azimuth), len(unified_distance)),
+                np.nan, dtype=np.float32
+            )
+
+            # 遍历去重后的仰角（仅一层循环）
+            for unique_idx, tilt_idx in enumerate(unique_tilt_indices):
+                ds = elevation_datasets.get(tilt_idx)
+                if ds is None or product not in ds.data_vars:
+                    continue
+
+                # 获取当前数据集的坐标和数据（四舍五入匹配映射表）
+                az_values = ds.azimuth.values
+                dist_values = ds.distance.values
+                product_values = ds[product].values  # shape: [n_az_current, n_dist_current]
+
+                # 批量查找有效坐标的索引（向量化操作，替代嵌套循环）
+                # 1. 筛选在统一坐标中存在的方位角和距离
+                valid_az_mask = np.isin(az_values, unified_azimuth)
+                valid_dist_mask = np.isin(dist_values, unified_distance)
+                valid_az_indices = np.where(valid_az_mask)[0]
+                valid_dist_indices = np.where(valid_dist_mask)[0]
+
+                if len(valid_az_indices) == 0 or len(valid_dist_indices) == 0:
+                    print("无有效数据，跳过")
+                    continue  # 无有效数据，跳过
+
+                # 2. 映射到统一坐标的索引（利用预创建的字典）
+                az_global_indices = np.array([az_to_idx[az] for az in az_values[valid_az_indices]])
+                dist_global_indices = [dist_to_idx[dist] for dist in dist_values[valid_dist_indices]]
+
+                # 3. 批量填充数据（用数组切片替代逐点赋值）
+                # 提取有效数据块（当前数据集的有效区域）
+                valid_data = product_values[valid_az_indices[:, np.newaxis], valid_dist_indices]
+                # 填充到全局数组的对应位置
+                product_data[unique_idx, az_global_indices[:, np.newaxis], dist_global_indices] = valid_data
+
+            data_vars[product] = (["elevation", "azimuth", "distance"], product_data)
+
+        # 第五步：处理辅助变量（同样使用向量化解法）
+        auxiliary_vars = {}
+        # 辅助变量列表（从返回的数据集可知这些变量存在于data_vars中）
+        aux_fields = ["radial_state", "seq_num", "rad_num", "Ele_Num", "Sec", "Mic_Sec", "Moment_um"]
+
+        # 为整数类型的辅助变量指定合适的填充值（避免使用NaN）
+        aux_fill_values = {
+            "radial_state": -9999,
+            "seq_num": -9999,
+            "rad_num": -9999,
+            "Ele_Num": -9999,
+            "Sec": -9999,
+            "Mic_Sec": -9999,
+            "Moment_um": -9999
+        }
+
+        for aux_field in aux_fields:
+            # 1. 检查变量是否存在于第一个数据集的data_vars中（关键修正）
+            first_ds = list(elevation_datasets.values())[0]
+            # print(first_ds.data_vars)
+            if aux_field not in first_ds.data_vars:
+                print(f"辅助变量 {aux_field} 不在数据集中，跳过")
+                continue
+
+            # 2. 初始化辅助变量数组（使用int32类型和对应填充值）
+            # 维度为 (elevation, azimuth)，与需求一致
+            aux_data = np.full(
+                (n_unique_elev, len(unified_azimuth)),
+                aux_fill_values[aux_field],
+                dtype=np.int32  # 所有辅助变量均为int32类型
+            )
+
+            # 3. 遍历每个去重后的仰角，填充数据
+            for unique_idx, tilt_idx in enumerate(unique_tilt_indices):
+                ds = elevation_datasets.get(tilt_idx)
+                if ds is None or aux_field not in ds.data_vars:
+                    continue  # 跳过无数据的情况
+
+                # 获取当前数据集的方位角和辅助变量值
+                az_values = ds.azimuth.values
+                aux_values = ds[aux_field].values  # 从data_vars中获取（关键修正）
+
+                # 验证辅助变量维度是否正确（应为(azimuth,)）
+                if aux_values.shape != (len(az_values),):
+                    print(f"辅助变量 {aux_field} 维度错误，预期{(len(az_values),)}，实际{aux_values.shape}")
+                    continue
+
+                # 4. 匹配全局方位角索引（向量化解法）
+                # 查找当前方位角在全局方位角中的位置
+                valid_az_mask = np.isin(az_values, unified_azimuth)
+                valid_az_indices = np.where(valid_az_mask)[0]
+                if len(valid_az_indices) == 0:
+                    print(f"仰角 {unique_idx} 无有效方位角数据，跳过 {aux_field}")
+                    continue
+
+                # 映射到全局索引
+                az_global_indices = [az_to_idx[az] for az in az_values[valid_az_indices]]
+
+                # 5. 填充数据到对应位置
+                aux_data[unique_idx, az_global_indices] = aux_values[valid_az_indices]
+
+            # 6. 检查是否有有效数据，避免全填充值的变量
+            if np.all(aux_data == aux_fill_values[aux_field]):
+                print(f"辅助变量 {aux_field} 无有效数据，未添加")
+                continue
+
+            # 添加到辅助变量字典，维度为(elevation, azimuth)
+            auxiliary_vars[aux_field] = (["elevation", "azimuth"], aux_data)
+            # print(f"成功添加辅助变量 {aux_field}，维度: {aux_data.shape}")
+
+        # 合并所有数据变量（保持原样）
+        all_data_vars = {
+            **data_vars, **{key: (["elevation"], unique_scan_config[key]) for key in unique_scan_config},
+            **auxiliary_vars
+        }
+        # print(all_data_vars)
+
+        # 创建综合属性和坐标（保持原样）
+        combined_attrs = dict(list(elevation_datasets.values())[0].attrs)
+        combined_attrs.update({
+            # "elevation_angles": unique_elevations,
+            # "elevation_count": n_unique_elev,
+            "products": list(all_products),
+            # "azimuth_count": len(unified_azimuth),
+            # "distance_count": len(unified_distance),
+            # "max_distance": float(unified_distance[-1]) if len(unified_distance) > 0 else 0,
+        })
+        self.scan_config_dict = unique_scan_config
+
+        coords = {
+            "elevation": unique_elevations,
+            "azimuth": unified_azimuth,
+            "distance": unified_distance
+        }
+        combined_ds = xr.Dataset(all_data_vars, coords=coords, attrs=combined_attrs)
+        return combined_ds
 
     def save_multi_time_volume_chunked(self,radar_objects_list, elevation_configs, drange, out_file):
         """
@@ -891,17 +1111,23 @@ class StandardData(RadarBase):
         )
 
         # 创建坐标映射字典（用于快速匹配全局索引）
-        elev_to_idx = {round(elev, 6): idx for idx, elev in enumerate(elevs)}  # 保留5位小数避免精度问题
-        az_to_idx = {round(az, 6): idx for idx, az in enumerate(azis)}
+        elev_to_idx = {elev: idx for idx, elev in enumerate(elevs)}
+        az_to_idx = {az: idx for idx, az in enumerate(azis)}
         dist_to_idx = {dist: idx for idx, dist in enumerate(dists)}  # 新增：distance值→全局索引映射
 
         # 创建 NetCDF 文件
-        with Dataset(out_file, "w", format="NETCDF4") as nc:
+        time_dim_attrs = ["scan_type", "pulse_width", "scan_start_time", "cut_number", "nyquist_vel",
+                          "pol_type", "products"]
+        begin_time = time.time()
+        total_time_points = len(radar_objects_list)
+        with (Dataset(out_file, "w", format="NETCDF4") as nc):
             # 创建维度
             nc.createDimension("time", len(times))
             nc.createDimension("elevation", len(elevs))
             nc.createDimension("azimuth", len(azis))
             nc.createDimension("distance", len(dists))
+
+
 
             # 写入坐标变量
             tvar = nc.createVariable("time", "f8", ("time",))
@@ -918,21 +1144,43 @@ class StandardData(RadarBase):
             sample_ds = radar_objects_list[0].get_multi_elevation_data(elevation_configs[0], drange)
             if sample_ds is None:
                 raise ValueError("第一个雷达对象无有效数据，无法定义变量结构")
+            original_attrs = sample_ds.attrs  # 提取参考数据集的所有属性
+            for key, value in original_attrs.items():
+                if key.lower() not in time_dim_attrs:  # 跳过已转为时间维度的属性（不区分大小写）
+                    nc.setncattr(key, value)
+
+            for attr in time_dim_attrs:
+                # pol_type为整数类型，其他属性根据实际类型调整（如pulse_width可能为float）
+                dtype = np.int32 if attr in ["pol_type", "scan_type", "cut_number"] else np.float32
+                fill_value = -9999 if dtype == np.int32 else np.nan  # 整数用-9999填充
+
+                vars_dict[attr] = nc.createVariable(
+                    attr, dtype, ("time",),  # 维度为(time,)
+                    zlib=True, complevel=1,
+                    fill_value=fill_value,
+                    chunksizes=(1,)  # 按时间分块，提高读写效率
+                )
+            # 关键步骤：写入属性
+            # for key, value in original_attrs.items():
+            #     nc.setncattr(key, value)  # 逐个设置属性
 
             for prod in products:
                 if prod not in sample_ds.data_vars:
+                    print("没有",prod,sample_ds.data_vars)
                     continue
                 data = sample_ds[prod].values
                 # 根据数据维度定义变量维度
+
                 if data.ndim == 1:  # (elevation,)
                     vars_dict[prod] = nc.createVariable(
                         prod, "f4", ("time", "elevation"), zlib=True, complevel=1, shuffle=True,
                         chunksizes=(1, len(elevs)), fill_value=np.nan
                     )
-                elif data.ndim == 2:  # (azimuth, distance) → 实际是单仰角下的(azimuth, distance)
+                elif data.ndim == 2:  # (elevation, azimuth)
                     vars_dict[prod] = nc.createVariable(
-                        prod, "f4", ("time", "elevation", "azimuth", "distance"), zlib=True,
-                        chunksizes=(1, 1, len(azis), len(dists)), fill_value=np.nan, complevel=1, shuffle=True
+                        prod, "i4", ("time", "elevation", "azimuth"),
+                        zlib=True, complevel=1, shuffle=True,
+                        chunksizes=(1, 1, len(azis)), fill_value=-9999
                     )
                 elif data.ndim == 3:  # (elevation, azimuth, distance)
                     vars_dict[prod] = nc.createVariable(
@@ -941,13 +1189,19 @@ class StandardData(RadarBase):
                     )
 
             # 分块写入数据（逐时间点）
-            for t_idx, (radar_obj, elev_config) in enumerate(zip(radar_objects_list, elevation_configs)):
-                print(f"写入第 {t_idx + 1}/{len(radar_objects_list)} 个时间点")
+            # for t_idx, (radar_obj, elev_config) in enumerate(zip(radar_objects_list, elevation_configs)):
+            for t_idx, (radar_obj, elev_config) in enumerate(tqdm(zip(radar_objects_list, elevation_configs),
+                total=total_time_points,
+                desc="写入数据",
+                unit="时间点"
+            )):
+                # print(f"写入第 {t_idx + 1}/{len(radar_objects_list)} 个时间点")
+                # if t_idx > 10: break
                 start_time = time.time()
-
                 ds_start = time.time()
                 ds = radar_obj.get_multi_elevation_data(elev_config, drange)
-                print(ds)
+                # if t_idx %10 == 0:
+                #     print(ds)
                 ds_end = time.time()
                 print(f"  获取数据集耗时: {ds_end - ds_start:.4f}s")
 
@@ -955,8 +1209,15 @@ class StandardData(RadarBase):
                     print('跳过无数据的时间点')
                     continue  # 跳过无数据的时间点
 
+                # 处理时间维度属性
+                vars_dict["pol_type"][t_idx] = ds.attrs.get("polar_type", -9999)
+                vars_dict["scan_type"][t_idx] = ds.attrs.get("scan_type", -9999)
+                vars_dict["pulse_width"][t_idx] = ds.attrs.get("pulse_width", -9999)
+                vars_dict["scan_start_time"][t_idx] = ds.attrs.get("pulse_width", -9999)
+                vars_dict["cut_number"][t_idx] = ds.attrs.get("pulse_width", -9999)
+
                 # 获取当前数据集的坐标（用于匹配全局索引）
-                coords_start = time.time()
+                # coords_start = time.time()
                 current_elevs = ds.elevation.values
                 current_azis = ds.azimuth.values
                 current_dists = ds.distance.values  # 当前数据集的distance值
@@ -964,7 +1225,7 @@ class StandardData(RadarBase):
                 # 预先计算本次 time 的映射（一次性）
                 # 统一四舍五入到6位：与 collect_metadata 中一致
                 az_rounded = current_azis
-                elev_rounded = np.round(current_elevs,6)
+                elev_rounded = current_elevs
                 dist_rounded = current_dists
 
                 # boolean masks and local indices
@@ -972,10 +1233,17 @@ class StandardData(RadarBase):
                 valid_dist_mask = np.isin(dist_rounded, list(dist_to_idx.keys()))
                 valid_elev_mask = np.isin(elev_rounded, list(elev_to_idx.keys()))
 
-                if not np.any(valid_elev_mask) or not np.any(valid_az_mask):
-                    print("  本时间点无有效仰角或方位，跳过")
+
+                if not np.any(valid_elev_mask):
                     print(ds.elevation.values)
                     print(list(elev_to_idx.keys()))
+                    print("  本时间点无有效仰角，跳过")
+                    continue
+
+                if not np.any(valid_az_mask):
+                    print(ds.azimuth.values[100:120],max(ds.azimuth.values))
+                    print(list(az_to_idx.keys())[100:120],max(list(az_to_idx.keys())))
+                    print("  本时间点无有效方角，跳过")
                     continue
 
                 # 当前数据中有效的索引
@@ -989,47 +1257,45 @@ class StandardData(RadarBase):
                 valid_dist_globals = [dist_to_idx[d] for d in dist_rounded[valid_dist_indices]]
                 valid_elev_globals = [elev_to_idx[e] for e in elev_rounded[valid_elev_indices]]
 
-                coords_end = time.time()
-                print(f"  坐标预处理耗时: {coords_end - coords_start:.4f}s")
+                # coords_end = time.time()
+                # print(f"  坐标预处理耗时: {coords_end - coords_start:.4f}s")
 
                 for prod in products:
                     if prod not in ds.data_vars:
                         print('跳过数据集中不存在的产品')
                         continue  # 跳过数据集中不存在的产品
                     data = ds[prod].values
-
                     # 处理1D数据（elevation,）
                     if data.ndim == 1:
                         # 维度：(elevation,) → 写入 (time, elevation)
                         for e_idx, elev in enumerate(current_elevs):
-                            elev_key = round(elev, 6)
-                            e_global = elev_to_idx.get(elev_key, None)
+                            e_global = np.where(np.isclose(elevs, elev, atol=1e-3))[0]
                             if e_global is not None:
                                 vars_dict[prod][t_idx, e_global] = data[e_idx]
+                            else:
+                                print('没有对应位置')
 
-                    # 处理2D数据（azimuth, distance）→ 单仰角（需从数据集提取当前仰角）
+                    # 处理2D数据（仰角, 方位角）
                     elif data.ndim == 2:
-                        # 当前数据集的仰角（单仰角场景）
-                        current_elev = round(current_elevs[0], 6)  # 假设2D数据对应单个仰角
-                        e_global = elev_to_idx.get(current_elev, None)
-                        if e_global is None:
-                            continue
+                        # # elevation → global
+                        # valid_elev_mask = np.isin(current_elevs, list(elev_to_idx.keys()))
+                        # valid_elev_indices = np.where(valid_elev_mask)[0]
+                        # valid_elev_globals = [elev_to_idx[e] for e in current_elevs[valid_elev_indices]]
+                        #
+                        # # azimuth → global
+                        # valid_az_mask = np.isin(current_azis, list(az_to_idx.keys()))
+                        # valid_az_indices = np.where(valid_az_mask)[0]
+                        # valid_az_globals = [az_to_idx[az] for az in current_azis[valid_az_indices]]
 
-                        # 匹配方位角
-                        az_rounded = current_azis
-                        valid_az_mask = np.isin(az_rounded, list(az_to_idx.keys()))
-                        valid_az_indices = np.where(valid_az_mask)[0]
-                        valid_az_globals = [az_to_idx[az] for az in az_rounded[valid_az_mask]]
-
-                        # 写入数据：只填充有效distance的位置（避免因长度不匹配导致错位）
-                        # 数据形状：(valid_az, valid_dist) → 写入全局(az_global, dist_global)
-                        vars_dict[prod][t_idx, e_global, valid_az_globals, valid_dist_globals] = (
-                            data[valid_az_indices[:, np.newaxis], valid_dist_indices]
-                        )
+                        # 写入
+                        for e_local, e_global in enumerate(valid_elev_globals):
+                            vars_dict[prod][t_idx, e_global, valid_az_globals] = data[
+                                valid_elev_indices[e_local], valid_az_indices]
 
                     # 处理3D数据（elevation, azimuth, distance）
                     elif data.ndim == 3:
                         if len(valid_elev_indices) == 0 or len(valid_az_indices) == 0 or len(valid_dist_indices) == 0:
+                            print('没找到数据')
                             continue
                         tmp = data[np.ix_(valid_elev_indices, valid_az_indices, valid_dist_indices)]
                         for i_local, e_global in enumerate(valid_elev_globals):
@@ -1055,9 +1321,10 @@ class StandardData(RadarBase):
                         #     # 写入全局对应位置
                         #     vars_dict[prod][t_idx, e_global, valid_az_globals, valid_dist_globals] = valid_data
                 total_time = time.time() - start_time
-                print(f"  第 {t_idx + 1} 个时间点处理完成，总耗时: {total_time:.4f}s\n")
-
-        print(f"数据写入完成，文件：{out_file}")
+                print(f"  单时间点耗时: {total_time:.4f}s\n")
+        all_time = time.time() - begin_time
+        print(f"数据写入完成，文件：{out_file}\n"
+              f"总耗时:{all_time:.4f}s")
 
 
     def get_multi_time_volume_data(self,radar_objects_list: List,
@@ -1260,7 +1527,7 @@ class StandardData(RadarBase):
         print(f"数据集维度: {dict(combined_ds.sizes)}")
         return combined_ds
 
-    def collect_metadata_old(self, radar_objects_list, elevation_configs, drange):
+    def collect_metadata(self, radar_objects_list, elevation_configs, drange):
         """
         快速收集维度信息：通过记录最大distance值生成统一坐标
         """
@@ -1270,14 +1537,14 @@ class StandardData(RadarBase):
         all_products = set()
         max_distance_value = 0.0  # 记录所有数据集中的最大距离值
         first_distance = None  # 记录第一个数据集的完整distance数组（用于步长）
-        auxiliary_fields = {"radial_state", "seq_num", "rad_num",
-                            "Ele_Num", "Sec", "Mic_Sec", "Moment_um"}
+        # auxiliary_fields = {"radial_state", "seq_num", "rad_num",
+        #                     "Ele_Num", "Sec", "Mic_Sec", "Moment_um"}
 
         print("获取维度信息（最大距离优化模式）")
         for i, (radar_obj, elev_config) in enumerate(zip(radar_objects_list, elevation_configs)):
             print(f"读取第{i + 1}/{len(radar_objects_list)}个文件")
-            print(radar_obj)
             ds = radar_obj.get_multi_elevation_data(elev_config, drange)
+            # if i > 10: break
             if ds is None:
                 continue
 
@@ -1290,8 +1557,8 @@ class StandardData(RadarBase):
             time_coords.append(scan_time)
 
             # 收集仰角和方位角
-            all_elevations.update(ds.elevation.values)
-            all_azimuths.update(ds.azimuth.values)
+            all_elevations.update(np.round(ds.elevation.values,6))
+            all_azimuths.update(np.round(ds.azimuth.values,6))
 
             # 记录第一个数据集的完整distance（用于获取步长和起点）
             if first_distance is None:
@@ -1310,9 +1577,8 @@ class StandardData(RadarBase):
 
             # 收集产品类型
             for var in ds.data_vars:
-                if var not in auxiliary_fields:
-                    all_products.add(var)
-
+                # if var not in auxiliary_fields:
+                all_products.add(var)
         # 处理异常情况
         if first_distance is None:
             raise ValueError("未从任何数据集获取到distance信息")
@@ -1346,7 +1612,7 @@ class StandardData(RadarBase):
             "products": sorted(list(all_products))
         }
 
-    def collect_metadata(self, radar_objects_list, elevation_configs, drange):
+    def collect_metadata_old(self, radar_objects_list, elevation_configs, drange):
         """
         更高效地收集维度信息：
         - distance取所有产品中数据量最大的那个
@@ -1375,7 +1641,7 @@ class StandardData(RadarBase):
 
             # 方位角（取该tilt的aux）
             sample_tilt = list(elev_config.keys())[0]
-            azimuths = radar_obj.aux[sample_tilt]["azimuth"]
+            azimuths = np.deg2rad(radar_obj.aux[sample_tilt]["azimuth"])
             all_azimuths.update(azimuths)
 
             # 距离：找到最大ngates的那个
